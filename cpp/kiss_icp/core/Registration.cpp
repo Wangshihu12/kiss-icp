@@ -135,34 +135,65 @@ Registration::Registration(int max_num_iteration, double convergence_criterion, 
         tbb::global_control::max_allowed_parallelism, static_cast<size_t>(max_num_threads_));
 }
 
+/**
+ * [功能描述]：执行点云到地图的ICP配准算法，估计最优位姿变换
+ * @param frame：待配准的源点云，包含当前帧的3D点集合
+ * @param voxel_map：目标地图的体素哈希表，作为配准的参考
+ * @param initial_guess：初始位姿猜测，基于运动模型预测的变换矩阵
+ * @param max_distance：最大对应距离阈值，超过此距离的点对将被忽略
+ * @param kernel_scale：核函数尺度参数，用于鲁棒估计中的权重计算
+ * @return Sophus::SE3d：返回优化后的SE(3)位姿变换矩阵
+ */
 Sophus::SE3d Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &frame,
                                             const VoxelHashMap &voxel_map,
                                             const Sophus::SE3d &initial_guess,
                                             const double max_distance,
                                             const double kernel_scale) {
+    // 检查地图是否为空，如果为空则直接返回初始猜测
+    // 避免在空地图上进行无意义的配准计算
     if (voxel_map.Empty()) return initial_guess;
 
-    // Equation (9)
+    // 公式(9)：复制源点云并应用初始变换
+    // 将待配准点云变换到初始猜测位姿，作为ICP迭代的起始点
     std::vector<Eigen::Vector3d> source = frame;
     TransformPoints(initial_guess, source);
 
-    // ICP-loop
+    // 初始化ICP累积变换矩阵，用于记录迭代过程中的总变换
     Sophus::SE3d T_icp = Sophus::SE3d();
+    
+    // ICP主迭代循环，最多执行max_num_iterations_次迭代
     for (int j = 0; j < max_num_iterations_; ++j) {
-        // Equation (10)
+        // 公式(10)：数据关联步骤
+        // 为源点云中的每个点在目标地图中找到最近邻对应点
+        // 只保留距离小于max_distance的有效对应关系
         const auto correspondences = DataAssociation(source, voxel_map, max_distance);
-        // Equation (11)
+        
+        // 公式(11)：构建线性系统
+        // 基于点对对应关系构建最小二乘优化的线性方程组
+        // JTJ是海塞矩阵(Hessian)，JTr是梯度向量，kernel_scale用于鲁棒估计
         const auto &[JTJ, JTr] = BuildLinearSystem(correspondences, kernel_scale);
+        
+        // 求解线性系统得到位姿增量
+        // 使用LDLT分解求解 JTJ * dx = -JTr，得到李代数空间的增量向量
         const Eigen::Vector6d dx = JTJ.ldlt().solve(-JTr);
+        
+        // 将李代数增量转换为SE(3)群上的变换矩阵
         const Sophus::SE3d estimation = Sophus::SE3d::exp(dx);
-        // Equation (12)
+        
+        // 公式(12)：更新源点云位姿
+        // 用估计的变换增量更新源点云的位置
         TransformPoints(estimation, source);
-        // Update iterations
+        
+        // 累积变换：将当前迭代的变换增量合并到总变换中
         T_icp = estimation * T_icp;
-        // Termination criteria
+        
+        // 收敛性检查：如果变换增量足够小，则认为已收敛，提前退出迭代
+        // dx.norm()计算增量向量的二范数，小于阈值则停止优化
         if (dx.norm() < convergence_criterion_) break;
     }
-    // Spit the final transformation
+    
+    // 返回最终的变换结果
+    // 将ICP迭代得到的相对变换与初始猜测组合，得到绝对位姿
     return T_icp * initial_guess;
 }
 
